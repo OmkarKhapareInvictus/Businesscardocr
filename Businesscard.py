@@ -1,166 +1,297 @@
 import os
 import re
-import warnings
-
-# Suppress PyTorch warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="torch.*")
-warnings.filterwarnings("ignore", message=".*torch.quantize_per_tensor.*")
-warnings.filterwarnings("ignore", message=".*pin_memory.*")
-
+import time
 import cv2
-import easyocr
+import numpy as np
 import pandas as pd
+import pytesseract
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Initialize EasyOCR reader
-reader = easyocr.Reader(['en'], gpu=False)
+# --- Configure Tesseract Path ---
+tesseract_cmd_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(tesseract_cmd_path):
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd_path
 
-CSV_FILE = "contacts_data.csv"
+CSV_FILE = "scanned_addresses.csv"
+IMAGE_DIR = "scanned_images"
+TOTAL_BURST_FRAMES = 100
 
-def find_best_orientation(img):
+# Strict minimal schema: only serial, address, and status
+ADDRESS_CSV_COLUMNS = ["Serial_No", "Address", "Status"]
+
+os.makedirs(IMAGE_DIR, exist_ok=True)
+
+
+def get_next_serial_number(file_path=CSV_FILE):
+    """Determines the next consecutive numeric Serial Number."""
+    if os.path.exists(file_path):
+        try:
+            df = pd.read_csv(file_path)
+            if "Serial_No" in df.columns and len(df) > 0:
+                valid_ids = pd.to_numeric(df["Serial_No"], errors="coerce").dropna()
+                if not valid_ids.empty:
+                    return int(valid_ids.max()) + 1
+        except Exception:
+            pass
+    return 1
+
+
+def clean_address(text):
+    """Normalizes address string for TF-IDF comparison."""
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", str(text).lower())
+    return " ".join(cleaned.split())
+
+
+def check_scanned_against_all_saved_addresses(scanned_address, file_path=CSV_FILE, threshold=0.45):
+    """Checks the scanned card address against all saved addresses in the CSV.
+    Returns: (all_results_list, top_match_dict, is_matched)
     """
-    Tests 0°, 90°, 180°, and 270° rotations.
-    Selects the orientation that produces the most valid alphabetical words.
-    """
-    rotations = [
-        (0, img),
-        (90, cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)),
-        (180, cv2.rotate(img, cv2.ROTATE_180)),
-        (270, cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE))
-    ]
+    if not os.path.exists(file_path) or not scanned_address.strip() or scanned_address == "N/A":
+        return [], None, False
 
-    best_angle = 0
-    best_image = img
-    best_results = []
-    max_valid_words = -1
+    try:
+        df = pd.read_csv(file_path)
+        if df.empty or "Address" not in df.columns:
+            return [], None, False
 
-    for angle, rotated_mat in rotations:
-        # Quick OCR pass to check word validity
-        results = reader.readtext(rotated_mat, detail=1, paragraph=False)
-        
-        # Count words with 3 or more letters (rejects single digits/symbols)
-        valid_words = 0
-        for _, text, conf in results:
-            clean = re.sub(r'[^a-zA-Z]', '', text)
-            if len(clean) >= 3 and conf > 0.2:
-                valid_words += 1
+        valid_rows = df[df["Address"].fillna("").str.strip().ne("") & (df["Address"] != "N/A")].copy()
+        if valid_rows.empty:
+            return [], None, False
 
-        if valid_words > max_valid_words:
-            max_valid_words = valid_words
-            best_angle = angle
-            best_image = rotated_mat
-            best_results = results
+        all_saved_addresses = [clean_address(a) for a in valid_rows["Address"].tolist()]
+        cleaned_query = clean_address(scanned_address)
 
-    print(f"[INFO] Auto-detected best orientation: {best_angle}° rotation")
-    return best_image, best_results
+        if not cleaned_query.strip():
+            return [], None, False
 
-def extract_entities(text_lines):
-    full_text = " \n ".join(text_lines)
+        # Compute TF-IDF matrix
+        corpus = all_saved_addresses + [cleaned_query]
+        vectorizer = TfidfVectorizer(token_pattern=r"(?u)\b\w+\b")
+        tfidf_matrix = vectorizer.fit_transform(corpus)
 
-    # 1. Email Address
-    email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
-    emails = re.findall(email_pattern, full_text)
-    email = emails[0].lower() if emails else "N/A"
+        # Compute Cosine similarity
+        similarity_vector = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1]).flatten()
 
-    # 2. Phone / Mobile Number
-    phone_pattern = r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,5}\)?[-.\s]?\d{3,5}[-.\s]?\d{3,5}'
-    raw_phones = re.findall(phone_pattern, full_text)
-    valid_phones = [p.strip() for p in raw_phones if len(re.sub(r'\D', '', p)) >= 10]
-    phone = valid_phones[0] if valid_phones else "N/A"
+        comparison_results = []
+        for idx, row in valid_rows.reset_index(drop=True).iterrows():
+            score_pct = round(float(similarity_vector[idx]) * 100, 2)
+            comparison_results.append({
+                "Serial_No": row.get("Serial_No", "Unknown"),
+                "Saved_Address": str(row.get("Address", "")),
+                "Similarity_Pct": score_pct,
+                "Is_Match": score_pct >= (threshold * 100)
+            })
 
-    # 3. Keyword Dictionaries
-    position_keywords = [
-        'engineer', 'manager', 'developer', 'director', 'lead', 'consultant',
-        'officer', 'executive', 'founder', 'ceo', 'cto', 'associate', 'analyst', 'president'
-    ]
-    company_keywords = [
-        'ltd', 'limited', 'pvt', 'inc', 'corp', 'solutions', 'tech', 'services', 
-        'systems', 'group', 'co.', 'llc', 'studios', 'enterprises', 'invictus'
-    ]
+        comparison_results.sort(key=lambda x: x["Similarity_Pct"], reverse=True)
+        top_match = comparison_results[0] if comparison_results else None
+        is_matched = top_match["Is_Match"] if top_match else False
+
+        return comparison_results, top_match, is_matched
+
+    except Exception as e:
+        print(f"Error reading database: {e}")
+        return [], None, False
+
+
+def extract_address_only(raw_text):
+    """Extracts address lines from OCR text."""
+    lines = [line.strip() for line in raw_text.splitlines() if len(line.strip()) > 2]
+
     address_keywords = [
-        'street', 'road', 'floor', 'plot', 'city', 'state', 'pin', 'near', 
-        'opp', 'lane', 'avenue', 'nagar', 'sector', 'building'
+        "stop", "bus", "road", "rd", "street", "st", "lane", "nagar", "plot",
+        "opp", "near", "bldg", "flat", "floor", "dist", "kolhapur", "goa",
+        "pune", "mumbai", "bichalim", "delhi", "bangalore", "chennai", "sector", "phase"
     ]
+    
+    address_lines = [
+        l for l in lines
+        if any(k in l.lower() for k in address_keywords) and "@" not in l and not l.lower().startswith("www.")
+    ]
+    
+    detected_address = " ".join(address_lines) if address_lines else "N/A"
+    return re.sub(r"\s+", " ", detected_address).strip()
 
-    name = "N/A"
-    position = "N/A"
-    company = "N/A"
-    address_lines = []
 
-    cleaned = [line.strip() for line in text_lines if len(line.strip()) >= 2]
+def draw_overlay(image, is_matched, top_match, scanned_addr, total_checked):
+    """Renders real-time match status and percentage overlay onto the frame."""
+    annotated = image.copy()
+    h, w, _ = annotated.shape
 
-    for line in cleaned:
-        line_lower = line.lower()
+    badge_color = (0, 220, 0) if is_matched else (0, 70, 255)
 
-        if email != "N/A" and email in line_lower:
-            continue
-        if phone != "N/A" and re.sub(r'\D', '', phone) in re.sub(r'\D', '', line):
-            continue
+    if is_matched:
+        header = f"MATCHED: {top_match['Similarity_Pct']}% (Matches Serial #{top_match['Serial_No']})"
+        line1 = f"DB Addr: {top_match['Saved_Address'][:60]}..."
+    else:
+        best_pct = f"{top_match['Similarity_Pct']}%" if top_match else "0.0%"
+        best_id = f"Serial #{top_match['Serial_No']}" if top_match else "None"
+        header = f"NOT MATCHED (Highest: {best_pct} with {best_id})"
+        line1 = f"Checked {total_checked} entries -> Saved as new record"
 
-        if position == "N/A" and any(k in line_lower for k in position_keywords):
-            position = line
-            continue
+    line2 = f"Scanned: {scanned_addr[:65]}"
 
-        if company == "N/A" and any(k in line_lower for k in company_keywords):
-            company = line
-            continue
+    # Top Status Banner
+    cv2.rectangle(annotated, (15, 15), (w - 15, 75), (20, 20, 20), -1)
+    cv2.rectangle(annotated, (15, 15), (w - 15, 75), badge_color, 3)
+    cv2.putText(annotated, header, (30, 55), cv2.FONT_HERSHEY_DUPLEX, 0.75, badge_color, 2)
 
-        if any(k in line_lower for k in address_keywords) or (re.search(r'\b\d{5,6}\b', line) and len(line) > 8):
-            address_lines.append(line)
-            continue
+    # Bottom Details Banner
+    cv2.rectangle(annotated, (15, h - 85), (w - 15, h - 15), (20, 20, 20), -1)
+    cv2.rectangle(annotated, (15, h - 85), (w - 15, h - 15), badge_color, 2)
+    cv2.putText(annotated, line1, (25, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+    cv2.putText(annotated, line2, (25, h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
 
-        # Name heuristic: clean alphabetic string, 2-4 words, no numbers
-        if name == "N/A" and not re.search(r'\d', line):
-            words = line.split()
-            if 1 <= len(words) <= 4 and all(w.replace('.', '').isalpha() for w in words):
-                name = line
+    return annotated
 
-    return {
-        "Name": name,
-        "Position": position,
-        "Mobile No": phone,
-        "Company Name": company,
-        "Email": email,
-        "Address": ", ".join(address_lines) if address_lines else "N/A"
+
+def append_address_to_csv(serial_no, address, status="NEW", file_path=CSV_FILE):
+    """Appends only Serial_No, Address, and Status to the CSV file."""
+    record = {
+        "Serial_No": serial_no,
+        "Address": address,
+        "Status": status
     }
+    df_new = pd.DataFrame([record])[ADDRESS_CSV_COLUMNS]
+    try:
+        if os.path.exists(file_path):
+            df_new.to_csv(file_path, mode="a", header=False, index=False)
+        else:
+            df_new.to_csv(file_path, mode="w", header=True, index=False)
+        print(f"[✓] Saved new address to {file_path}")
+    except PermissionError:
+        backup = f"scanned_addresses_backup_{int(time.time())}.csv"
+        df_new.to_csv(backup, mode="w", header=True, index=False)
+        print(f"[!] File locked. Saved to backup: {backup}")
 
-def process_card(image_path):
-    if not os.path.isfile(image_path):
-        print(f"[ERROR] Cannot find file at: {image_path}")
-        return
 
-    # Load image
-    raw_img = cv2.imread(image_path)
-    if raw_img is None:
-        print(f"[ERROR] Could not decode image at: {image_path}")
-        return
+# --- Camera Loop ---
+cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open webcam.")
 
-    # Resize up if resolution is low
-    h, w = raw_img.shape[:2]
-    if max(h, w) < 1400:
-        scale = 1400.0 / max(h, w)
-        raw_img = cv2.resize(raw_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+current_serial = get_next_serial_number()
 
-    # 1. Automatically test and set correct orientation
-    best_img, ocr_results = find_best_orientation(raw_img)
+print("=" * 70)
+print(" ADDRESS MATCHER & DEDUPLICATOR")
+print(f" Next Available Serial No: #{current_serial}")
+print(" [ENTER] / [SPACE] -> Scan and Compare")
+print(" [Q]               -> Quit")
+print("=" * 70)
 
-    # Extract detected text lines
-    extracted_lines = [item[1].strip() for item in ocr_results if item[2] > 0.25 and len(item[1].strip()) > 1]
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-    print("\n--- Extracted Text ---")
-    for line in extracted_lines:
-        print(f"• {line}")
+    preview = frame.copy()
+    cv2.putText(
+        preview,
+        f"Next Serial: #{current_serial} | Press ENTER to Scan",
+        (20, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+    )
+    cv2.imshow("Address Scanner", preview)
 
-    # 2. Parse into structured data
-    card_data = extract_entities(extracted_lines)
+    key = cv2.waitKey(1) & 0xFF
 
-    print("\n--- Structured Card Info ---")
-    for k, v in card_data.items():
-        print(f"{k:15}: {v}")
+    if key in (13, 32):  # ENTER or SPACE
+        print(f"\n[*] Scanning {TOTAL_BURST_FRAMES} frames...")
+        color_frames = []
+        gray_frames = []
 
-    # 3. Save to CSV
-    df = pd.DataFrame([card_data])
-    df.to_csv(CSV_FILE, mode='a', header=not os.path.exists(CSV_FILE), index=False)
-    print(f"\n[SUCCESS] Output saved to '{CSV_FILE}'!")
+        for i in range(1, TOTAL_BURST_FRAMES + 1):
+            ret_burst, frame_burst = cap.read()
+            if not ret_burst:
+                continue
 
-if __name__ == "__main__":
-    process_card("invictuscard.jpeg")
+            color_frames.append(frame_burst.astype(np.float32))
+            gray_frames.append(cv2.cvtColor(frame_burst, cv2.COLOR_BGR2GRAY).astype(np.float32))
+
+            hud = frame_burst.copy()
+            cv2.putText(
+                hud,
+                f"Scanning: {i}/{TOTAL_BURST_FRAMES}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+            cv2.imshow("Address Scanner", hud)
+            cv2.waitKey(1)
+
+        if not gray_frames:
+            continue
+
+        # Noise reduction & OCR
+        final_color_card = np.mean(color_frames, axis=0).astype(np.uint8)
+        avg_gray = np.mean(gray_frames, axis=0).astype(np.uint8)
+
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        sharpened = cv2.filter2D(avg_gray, -1, kernel)
+        _, thresholded = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        raw_text = pytesseract.image_to_string(thresholded, config="--psm 11").strip()
+        if not raw_text:
+            raw_text = pytesseract.image_to_string(sharpened).strip()
+
+        scanned_address = extract_address_only(raw_text)
+
+        print("\n" + "-" * 60)
+        print(f"Scanned Address: {scanned_address}")
+        print("-" * 60)
+
+        # Match against saved addresses
+        all_results, top_match, is_matched = check_scanned_against_all_saved_addresses(scanned_address)
+
+        # Print all comparison percentages to terminal
+        if all_results:
+            print("Comparison Results:")
+            for item in all_results:
+                flag = "[MATCHED]" if item["Is_Match"] else "[NO MATCH]"
+                print(f" -> Serial #{item['Serial_No']}: {item['Similarity_Pct']}% match {flag}")
+                print(f"    Saved: {item['Saved_Address']}")
+        else:
+            print("[i] Database empty. No prior addresses to compare against.")
+
+        # Overlay results on frame
+        stamped_image = draw_overlay(
+            final_color_card,
+            is_matched,
+            top_match,
+            scanned_address,
+            len(all_results)
+        )
+
+        # Conditional action
+        if is_matched:
+            print("\n" + "=" * 60)
+            print(f"RESULT: MATCHED")
+            print(f"Match Percentage : {top_match['Similarity_Pct']}%")
+            print(f"Matched With     : Serial #{top_match['Serial_No']}")
+            print(f"DB Address       : {top_match['Saved_Address']}")
+            print(f"Action           : NOT saved to CSV (Duplicate).")
+            print("=" * 60 + "\n")
+        else:
+            pct_display = f"{top_match['Similarity_Pct']}%" if top_match else "0.0%"
+            print("\n" + "=" * 60)
+            print(f"RESULT: NOT MATCHED (Top similarity was {pct_display})")
+            print(f"Action: Saved to CSV as Serial #{current_serial}")
+            print("=" * 60 + "\n")
+
+            append_address_to_csv(current_serial, scanned_address, status="NEW")
+            current_serial += 1
+
+        cv2.imshow("Address Comparison Result", stamped_image)
+
+    elif key == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
